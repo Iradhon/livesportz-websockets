@@ -15,32 +15,62 @@ function broadcast(wss, payload){
     }
 }
 
+function rejectUpgrade(socket, statusCode, reason, body = ''){
+    socket.write(
+        `HTTP/1.1 ${statusCode} ${reason}\r\n` +
+        'Connection: close\r\n' +
+        'Content-Type: text/plain; charset=utf-8\r\n' +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        '\r\n' +
+        body
+    );
+    socket.destroy();
+}
+
 export function attachWebSocketServer(server) {
     const wss = new WebSocketServer({
-        server,
-        path: '/ws',
+        noServer: true,
         maxPayload: 1024 * 1024, // 1MB
     });
 
-    wss.on('connection', async (socket, req) => {
+    server.on('upgrade', async (req, socket, head) => {
+        const { pathname } = new URL(req.url, 'http://localhost');
+
+        if(pathname !== '/ws') {
+            rejectUpgrade(socket, 404, 'Not Found');
+            return;
+        }
+
+        if(!req.headers['user-agent']){
+            rejectUpgrade(socket, 403, 'Forbidden', 'Access denied');
+            return;
+        }
+
         if(wsArcjet){
             try {
                 const decision = await wsArcjet.protect(req)
 
                 if(decision.isDenied()){
-                    const code = decision.reason.isRateLimit() ? 1013 : 1008
-                    const reason = decision.reason.isRateLimit() ? 'Rate limit exceeded' : 'Access denied'
+                    const statusCode = decision.reason.isRateLimit() ? 429 : 403;
+                    const reason = decision.reason.isRateLimit() ? 'Too Many Requests' : 'Forbidden';
+                    const body = decision.reason.isRateLimit() ? 'Rate limit exceeded' : 'Access denied';
 
-                    socket.close(code, reason)
-                    return
+                    rejectUpgrade(socket, statusCode, reason, body);
+                    return;
                 }
             } catch (error) {
-                console.error('ws connection error', error)
-                socket.close(1011, 'server security error')
-                return
+                console.error('ws upgrade error', error)
+                socket.destroy();
+                return;
             }
         }
 
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req);
+        });
+    })
+
+    wss.on('connection', (socket) => {
         socket.isAlive = true;
         socket.on('pong', () => { socket.isAlive = true; });
 
